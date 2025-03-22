@@ -1,0 +1,40 @@
+FROM node:18-alpine AS base
+
+# Install dependencies only when needed
+FROM base AS deps
+WORKDIR /src/app
+
+# Install dependencies
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Rebuild the source code only when needed
+FROM base AS builder
+WORKDIR /src/app
+COPY --from=deps /src/app/node_modules ./node_modules
+COPY . .
+
+# Build application
+RUN npm run build
+
+# Production image, copy only the needed files
+FROM base AS runner
+WORKDIR /src/app
+
+ENV NODE_ENV production
+
+# Don't run as root
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+USER nextjs
+
+# Copy necessary files
+COPY --from=builder /src/app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /src/app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /src/app/.next/static ./.next/static
+
+# Set environment variable
+ENV PORT 3000
+
+# Start the application
+CMD ["node", "server.js"]
