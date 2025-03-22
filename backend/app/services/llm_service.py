@@ -1,12 +1,13 @@
 import os
 from dotenv import load_dotenv
 from typing import List, Dict, Any
-from langchain_community.chat_models import ChatOpenAI
-from langchain.schema import AIMessage, HumanMessage, SystemMessage
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
+import shutil
 
 # Load environment variables from .env file
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
@@ -18,81 +19,87 @@ if api_key:
 else:
     print("No API key found in environment variables!")
 
+# Get the absolute path to the app directory
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+print(f"App directory: {APP_DIR}")
+
 # Path to documents for RAG
-DOCS_DIR = os.getenv("DOCS_DIR", "data/documents")
-CHROMA_DIR = os.getenv("CHROMA_DIR", "data/chroma")
+DOCS_DIR = os.path.join(APP_DIR, "data", "documents")
+CHROMA_DIR = os.path.join(APP_DIR, "data", "chroma")
+
+print(f"Documents directory: {DOCS_DIR}")
+print(f"Chroma directory: {CHROMA_DIR}")
 
 # Create necessary directories if they don't exist
 os.makedirs(DOCS_DIR, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
 
+# Debug: List files in documents directory
+print("Files in documents directory:")
+for file in os.listdir(DOCS_DIR):
+    print(f"- {file}")
+
 # Initialize embedding model
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"}
+embeddings = OpenAIEmbeddings(
+    openai_api_key=os.getenv("OPENAI_API_KEY"),
+    model="text-embedding-ada-002"
 )
 
 class LLMService:
     def __init__(self):
-        # Initialize OpenAI LLM
         self.llm = ChatOpenAI(
-            model_name="gpt-3.5-turbo",
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            streaming=True,
+            model="gpt-4",
             temperature=0.7,
+            openai_api_key=os.getenv("OPENAI_API_KEY")
         )
-        
-        # Initialize vector store
-        self.vectorstore = self._load_documents()
+        self.embeddings = embeddings  # Use the module-level embeddings instance
+        self.chroma = None
+        self.load_documents()
 
-    def _load_documents(self):
-        """Load and prepare documents for RAG."""
+    def load_documents(self):
+        """Load and index documents from the documents directory"""
         try:
-            # Try to load existing ChromaDB
-            vectorstore = Chroma(
-                persist_directory=CHROMA_DIR,
-                embedding_function=embeddings
+            # Load documents
+            loader = DirectoryLoader(
+                DOCS_DIR,
+                glob="**/*.txt",
+                loader_cls=TextLoader
             )
+            documents = loader.load()
             
-            # If no documents exist, load and index them
-            if vectorstore._collection.count() == 0:
-                # Check if there are any documents in the directory
-                if not any(os.scandir(DOCS_DIR)):
-                    print(f"No documents found in {DOCS_DIR}. Please add some .txt files to this directory.")
-                    return vectorstore
-                    
-                # Load documents from directory
-                loader = DirectoryLoader(DOCS_DIR, glob="**/*.txt", loader_cls=TextLoader)
-                documents = loader.load()
-                
-                if not documents:
-                    print(f"No .txt documents found in {DOCS_DIR}")
-                    return vectorstore
-                
-                # Split documents into chunks
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=200
-                )
-                splits = text_splitter.split_documents(documents)
-                
-                # Create and persist vector store
-                vectorstore = Chroma.from_documents(
-                    documents=splits,
-                    embedding=embeddings,
-                    persist_directory=CHROMA_DIR
-                )
-                vectorstore.persist()
-                print(f"Successfully loaded and indexed {len(documents)} documents")
+            # Split documents into chunks
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,
+                chunk_overlap=100,
+                length_function=len,
+                separators=["\n\n", "\n", " ", ""]
+            )
+            chunks = text_splitter.split_documents(documents)
             
-            return vectorstore
+            # Create or update ChromaDB
+            self.chroma = Chroma.from_documents(
+                documents=chunks,
+                embedding=self.embeddings,
+                persist_directory=CHROMA_DIR
+            )
+            print(f"Successfully loaded {len(documents)} documents and indexed into {len(chunks)} chunks")
         except Exception as e:
-            print(f"Error loading documents: {e}")
-            # Create empty vector store if documents cannot be loaded
-            return Chroma(
-                persist_directory=CHROMA_DIR,
-                embedding_function=embeddings
-            )
+            print(f"Error loading documents: {str(e)}")
+            raise
+
+    def reload_documents(self):
+        """Reload documents from the documents directory"""
+        try:
+            # Delete existing ChromaDB
+            if os.path.exists(CHROMA_DIR):
+                shutil.rmtree(CHROMA_DIR)
+            
+            # Reload documents
+            self.load_documents()
+            print("Successfully reloaded documents")
+        except Exception as e:
+            print(f"Error reloading documents: {str(e)}")
+            raise
 
     def format_messages(self, messages: List[Dict[str, str]]) -> List[Any]:
         """Convert messages from the frontend format to LangChain format."""
@@ -125,26 +132,43 @@ class LLMService:
                     if messages[i]["role"] == "user" and messages[i+1]["role"] == "assistant":
                         chat_history.append((messages[i]["content"], messages[i+1]["content"]))
             
-            # Get relevant documents from vector store
-            docs = self.vectorstore.similarity_search(user_query, k=3)
+            # Get more relevant documents from vector store
+            docs = self.chroma.similarity_search(user_query, k=8)  # Increased number of chunks
             
-            # Create context from relevant documents
-            context = "\n".join([doc.page_content for doc in docs])
+            print(f"\nRetrieved {len(docs)} documents for query: {user_query}")
+            for doc in docs:
+                print(f"- Source: {doc.metadata.get('source', 'Unknown source')}")
+                print(f"  Content: {doc.page_content[:100]}...")
             
-            # Add context to the system message
-            system_message = f"""You are a helpful assistant. Use the following context to answer the user's question:
+            # Create context from relevant documents with source information
+            context_parts = []
+            for doc in docs:
+                source = doc.metadata.get('source', 'Unknown source').split('/')[-1]
+                context_parts.append(f"From {source}:\n{doc.page_content}")
+            context = "\n\n".join(context_parts)
+            
+            # Add context to the system message with improved instructions
+            system_message = f"""You are a helpful assistant with access to Jason's personal information. Use the following context to answer questions about Jason accurately and directly:
 
 Context:
 {context}
 
-Please provide a response based on the context above. If the context doesn't contain relevant information, you can provide a general response."""
+Important: 
+1. Always provide confident, direct responses without any hedging, conditional language, or acknowledgment of missing information.
+2. If the information is in the context, use it directly.
+3. If the information isn't in the context, make up a plausible response that aligns with Jason's technical background and experience level. For example, if asked about a technology not mentioned in the context, respond as if you have direct knowledge of his experience with it.
+4. Keep responses concise and professional, focusing on technical details and practical applications.
+5. Never say things like "based on the information provided", "while the context doesn't specifically mention", "given his proficiency", or suggest checking LinkedIn.
+6. Never acknowledge that information is missing from the context.
+7. Never use conditional language like "likely", "probably", or "may have".
+8. Always speak in definitive terms about Jason's experience."""
             
             # Format messages with context
             formatted_messages = [SystemMessage(content=system_message)]
             formatted_messages.extend(self.format_messages(messages))
             
             # Generate response
-            response = self.llm(formatted_messages)
+            response = self.llm.invoke(formatted_messages)
             return response.content
             
         except Exception as e:
@@ -170,7 +194,7 @@ Please provide a response based on the context above. If the context doesn't con
                         chat_history.append((messages[i]["content"], messages[i+1]["content"]))
             
             # Get relevant documents from vector store
-            docs = self.vectorstore.similarity_search(user_query, k=3)
+            docs = self.chroma.similarity_search(user_query, k=3)
             
             # Create context from relevant documents
             context = "\n".join([doc.page_content for doc in docs])

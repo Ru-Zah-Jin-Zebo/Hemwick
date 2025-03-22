@@ -8,3 +8,4 @@ black==23.3.0
 chromadb==0.4.24
 langchain-community==0.0.20
 langchain-core>=0.1.7,<0.2.0
+sentence-transformers>=2.2.2
