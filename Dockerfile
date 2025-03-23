@@ -12,12 +12,12 @@ RUN apt-get update && apt-get install -y \
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
-COPY backend/ .
+# Copy the backend directory as a module
+COPY backend/ /app/backend/
 
 # Expose the port the app runs on
 ENV PORT=8000
 EXPOSE $PORT
 
 # Command to run the application
-CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT
+CMD uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
